@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --job-name=test
+#SBATCH --nodelist=ubuntu
+#SBATCH --output=logs/routing_lora_edit_gpt_xl_mcf_step2000_%j.out
+#SBATCH --error=logs/routing_lora_edit_gpt_xl_mcf_step2000_%j.err
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=48G
+#SBATCH --time=24:00:00
+
+cd /home/leeg/Experiments/multi_lora_editing
+
+# UV 가상환경 활성화
+source .venv/bin/activate
+
+echo "시작: $(date) routing_lora_edit_gpt_xl_mcf_step2000"
+echo "CUDA: $(python -c 'import torch; print(torch.cuda.is_available())')"
+
+python -m experiments.evaluate \
+    --alg_name=Routing_LoRA_Edit \
+    --model_name="gpt2-xl" \
+    --hparams_fname="gpt2-xl.json" \
+    --ds_name="mcf" \
+    --dataset_size_limit="2000" \
+    --num_edits="100" \
+
+
+echo ""
+echo "=== 실험 완료 ==="
+echo "완료: $(date)"

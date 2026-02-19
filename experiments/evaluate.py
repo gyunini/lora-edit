@@ -29,6 +29,10 @@ from memit.memit_seq_main import apply_memit_seq_to_model
 from memit.memit_rect_main import apply_memit_rect_to_model
 from AlphaEdit import AlphaEditHyperParams
 from AlphaEdit.AlphaEdit_main import apply_AlphaEdit_to_model, get_cov
+from MultiLoRA import MultiLoRAHyperParams
+from MultiLoRA.routing_lora_edit import apply_Routing_LoRA_Edit, get_nullspace_A, apply_routing_hooks
+from MultiLoRA.routing_lora_edit_cw import apply_Routing_LoRA_Edit as apply_Routing_LoRA_Edit_CW, get_nullspace_A as get_nullspace_A_cw, apply_routing_hooks as apply_routing_hooks_cw, KBankCache
+from MultiLoRA.lora_editing_main import apply_lora_editing_to_model, get_nullspace_A as get_nullspace_A_lora
 from rome import ROMEHyperParams, apply_rome_to_model
 from util import nethook
 from util.globals import *
@@ -37,6 +41,9 @@ from nse.nse_main import apply_nse_to_model
 from glue_eval.glue_eval import GLUEEval
 ALG_DICT = {
     "AlphaEdit": (AlphaEditHyperParams, apply_AlphaEdit_to_model),
+    "Routing_LoRA_Edit": (MultiLoRAHyperParams, apply_Routing_LoRA_Edit),
+    "Routing_LoRA_Edit_CW": (MultiLoRAHyperParams, apply_Routing_LoRA_Edit_CW),
+    "LoRA_Edit": (MultiLoRAHyperParams, apply_lora_editing_to_model),
     "MEMIT_seq": (MEMITHyperParams, apply_memit_seq_to_model),
     "MEMIT_prune": (MEMITHyperParams, apply_memit_to_model),
     "MEMIT_rect": (MEMITHyperParams, apply_memit_rect_to_model),
@@ -134,7 +141,7 @@ def main(
     # Get cache templates
     cache_template = None
     if use_cache:
-        if any(alg in alg_name for alg in ["MEMIT","AlphaEdit", "MEMIT_seq", "MEMIT_prune", "MEMIT_rect"]):
+        if any(alg in alg_name for alg in ["MEMIT","AlphaEdit", "Routing_LoRA_Edit", "Routing_LoRA_Edit_CW", "LoRA_Edit", "MEMIT_seq", "MEMIT_prune", "MEMIT_rect"]):
             cache_template = (
                 KV_DIR
                 / f"{model_name.replace('/', '_')}_MEMIT"
@@ -190,7 +197,7 @@ def main(
                         },
                     )
                     print(f"Cached k/v pair at {cache_fname}")
-    if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "MEMIT_prune", "NSE"]):
+    if any(alg in alg_name for alg in ["AlphaEdit", "Routing_LoRA_Edit", "Routing_LoRA_Edit_CW", "LoRA_Edit", "MEMIT_seq", "MEMIT_prune", "NSE"]):
         # Iterate through dataset
         W_out = nethook.get_parameter(model, f"{hparams.rewrite_module_tmp.format(hparams.layers[-1])}.weight")
         if hparams.model_name == "gpt2-xl":
@@ -206,6 +213,27 @@ def main(
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model,tok,layer,hparams)
         torch.save(P, "null_space_project.pt")
+    
+    # Routing_LoRA_Edit/LoRA_Edit: Initialize A_matrices, B_bank, and U_bank
+    if alg_name in ["Routing_LoRA_Edit", "Routing_LoRA_Edit_CW", "LoRA_Edit"]:
+        A_matrices = {}  # layer -> A matrix
+        B_bank = {}      # layer -> list of B_j matrices
+        U_bank = {}      # layer -> list of U_j matrices (for routing)
+        router_stats_bank = {}  # layer -> list of stats dicts (for CW-Edit)
+        K_bank_cache = {}  # layer -> KBankCache (for CW-Edit)
+        for layer in hparams.layers:
+            if alg_name == "LoRA_Edit":
+                A_matrices[layer] = get_nullspace_A_lora(model, tok, layer, hparams)
+            elif alg_name == "Routing_LoRA_Edit_CW":
+                A_matrices[layer] = get_nullspace_A_cw(model, tok, layer, hparams)
+            else:
+                A_matrices[layer] = get_nullspace_A(model, tok, layer, hparams)
+            B_bank[layer] = []
+            U_bank[layer] = []
+            if alg_name == "Routing_LoRA_Edit_CW":
+                router_stats_bank[layer] = []
+                K_bank_cache[layer] = KBankCache(max_cols=hparams.router_kbank_max)
+        torch.save(A_matrices, f"{alg_name.lower()}_A_matrices.pt")
     # hs = get_module_input_output_at_words(
     #         model,
     #         tok,
@@ -241,9 +269,15 @@ def main(
             if conserve_memory
             else dict()
         )
-        etc_args = dict(cache_template=cache_template) if any(alg in alg_name for alg in ["ROME", "MEMIT","AlphaEdit", "MEMIT_seq", "MEMIT_prune", "NSE"]) else dict()
+        etc_args = dict(cache_template=cache_template) if any(alg in alg_name for alg in ["ROME", "MEMIT","AlphaEdit", "Routing_LoRA_Edit", "Routing_LoRA_Edit_CW", "LoRA_Edit", "MEMIT_seq", "MEMIT_prune", "NSE"]) else dict()
         seq_args = dict(cache_c=cache_c) if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]) else dict()
         nc_args = dict(P = P) if any(alg in alg_name for alg in ["AlphaEdit"]) else dict()
+        # Routing_LoRA_Edit specific args (U_bank for routing)
+        routing_lora_args = dict(A_matrices=A_matrices, B_bank=B_bank, U_bank=U_bank) if alg_name == "Routing_LoRA_Edit" else dict()
+        # Routing_LoRA_Edit_CW specific args (U_bank, router_stats_bank, K_bank_cache for CW-Edit)
+        routing_lora_cw_args = dict(A_matrices=A_matrices, B_bank=B_bank, U_bank=U_bank, router_stats_bank=router_stats_bank, K_bank_cache=K_bank_cache) if alg_name == "Routing_LoRA_Edit_CW" else dict()
+        # LoRA_Edit specific args (no U_bank)
+        lora_edit_args = dict(A_matrices=A_matrices, B_bank=B_bank) if alg_name == "LoRA_Edit" else dict()
         if cnt == 0 and args.downstream_eval_steps > 0:#do initial GLUE EVAL WITH ORIGINAL MODEL
             glue_results = {'edit_num': -1}
 
@@ -257,7 +291,58 @@ def main(
             with open(output_filename, "w") as f:
                 json.dump(glue_results, f, indent=4)
         start = time()
-        if any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]):
+        if alg_name == "Routing_LoRA_Edit":
+            edited_model, B_bank, U_bank = apply_algo(
+                model,
+                tok,
+                [
+                    {"case_id": record["case_id"], **rewrite_dict}
+                    for record in record_chunks
+                    for rewrite_dict in (
+                        record["requested_rewrite"]
+                        if isinstance(record["requested_rewrite"], list)
+                        else [record["requested_rewrite"]]
+                    )
+                ],
+                hparams,
+                **etc_args,
+                **routing_lora_args,
+            )
+        elif alg_name == "Routing_LoRA_Edit_CW":
+            edited_model, B_bank, U_bank, router_stats_bank = apply_algo(
+                model,
+                tok,
+                [
+                    {"case_id": record["case_id"], **rewrite_dict}
+                    for record in record_chunks
+                    for rewrite_dict in (
+                        record["requested_rewrite"]
+                        if isinstance(record["requested_rewrite"], list)
+                        else [record["requested_rewrite"]]
+                    )
+                ],
+                hparams,
+                **etc_args,
+                **routing_lora_cw_args,
+            )
+        elif alg_name == "LoRA_Edit":
+            edited_model, B_bank = apply_algo(
+                model,
+                tok,
+                [
+                    {"case_id": record["case_id"], **rewrite_dict}
+                    for record in record_chunks
+                    for rewrite_dict in (
+                        record["requested_rewrite"]
+                        if isinstance(record["requested_rewrite"], list)
+                        else [record["requested_rewrite"]]
+                    )
+                ],
+                hparams,
+                **etc_args,
+                **lora_edit_args,
+            )
+        elif any(alg in alg_name for alg in ["AlphaEdit", "MEMIT_seq", "NSE"]):
             edited_model, cache_c = apply_algo(
                 model,
                 tok,
@@ -388,6 +473,48 @@ def main(
     #         fact_token_strategy=hparams.fact_token,
     #     )[1].T
     # torch.save(hs, "post_edit_hs_memit.pt")
+    
+    # Apply routing hooks for Routing_LoRA_Edit when routing_mode != "none"
+    routing_hooks = None
+    if alg_name == "Routing_LoRA_Edit" and hparams.routing_mode != "none":
+        print(f"[Routing_LoRA_Edit] Applying routing hooks (mode={hparams.routing_mode})")
+        routing_hooks = apply_routing_hooks(
+            edited_model, hparams, A_matrices, B_bank, U_bank
+        )
+    elif alg_name == "Routing_LoRA_Edit_CW" and hparams.routing_mode != "none":
+        print(f"[Routing_LoRA_Edit_CW] Applying routing hooks (mode={hparams.routing_mode})")
+        # For evaluation, try GPU preload first for maximum speed, fallback to CPU-stacked if OOM
+        eval_hparams = hparams
+        if hasattr(hparams, 'router_chunk_edits') and hparams.router_chunk_edits > 0:
+            print(f"[Evaluation] Attempting GPU preload for maximum speed (chunking disabled)")
+            # Try GPU preload first (fastest, but may OOM)
+            eval_hparams = type(hparams)(**{
+                **hparams.__dict__, 
+                'router_chunk_edits': 0,  # Disable chunking
+                'router_preload_gpu': True  # Try GPU preload for speed
+            })
+            try:
+                routing_hooks = apply_routing_hooks_cw(
+                    edited_model, eval_hparams, A_matrices, B_bank, U_bank, router_stats_bank
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    print(f"[Evaluation] GPU preload failed (OOM), falling back to CPU-stacked mode")
+                    eval_hparams = type(hparams)(**{
+                        **hparams.__dict__, 
+                        'router_chunk_edits': 0,
+                        'router_preload_gpu': False  # Fallback to CPU-stacked
+                    })
+                    routing_hooks = apply_routing_hooks_cw(
+                        edited_model, eval_hparams, A_matrices, B_bank, U_bank, router_stats_bank
+                    )
+                else:
+                    raise
+        else:
+            routing_hooks = apply_routing_hooks_cw(
+                edited_model, eval_hparams, A_matrices, B_bank, U_bank, router_stats_bank
+            )
+    
     start = time()
     gen_test_vars = [snips, vec]
     for record in ds:
@@ -422,6 +549,10 @@ def main(
         #         nethook.get_parameter(model, k)[...] = v.to("cuda")
 
         print("Evaluation took", time() - start)
+    
+    # Remove routing hooks after evaluation
+    if routing_hooks is not None:
+        routing_hooks.remove_hooks()
 def get_project(model, tok, layer, hparams):
     force_recompute = False
     cov = get_cov(
@@ -464,7 +595,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--alg_name",
-        choices=["AlphaEdit","MEMIT_rect", "MEMIT_seq","MEMIT_prune", "MEMIT", "ROME", "FT", "MEND","NSE"],
+        choices=["AlphaEdit", "Routing_LoRA_Edit", "Routing_LoRA_Edit_CW", "LoRA_Edit", "MEMIT_rect", "MEMIT_seq","MEMIT_prune", "MEMIT", "ROME", "FT", "MEND","NSE"],
         default="ROME",
         help="Editing algorithm to use. Results are saved in results/<alg_name>/<run_id>, "
         "where a new run_id is generated on each run. "
